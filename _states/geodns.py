@@ -1,102 +1,72 @@
-# -*- coding: utf-8 -*-
 '''
-Module for handling GeoDNS record manipulation.
-
+GeoDNS state module for use with GeoDNS salt module.
 Author: Total Server Solutions
 
-:configuration: This module is not usable until the following are specified
-    either in a pillar or in the minion's config file::
+Todo: document these a little nicer if we want to open-source these
 
-    geodns.datadir = '/var/dns'
-    
 '''
+def __virtual__():
+    return 'geodns'
 
-from __future__ import absolute_import
-import os
-import json
+# compare record values even if order is different
+# convert lists of lists to tuples since they are hashable
+def _values_equal(list1, list2):
+    set1 = set(map(tuple, list1))
+    set2 = set(map(tuple, list2))
+    return set1 == set2
 
-def _get_zone(name):
-    datadir = __pillar__['geodns.datadir']
-    zone_file = get_full_path(name)
-    if os.path.exists(zone_file):
-        with open(zone_file, 'r') as content_file:
-            content = content_file.read()
-            content = json.loads(content)
-        return {zone_file: content}
-    return {'Error': 'Could not find zone file {0}'.format(zone_file)}
-
-def get_full_path(name):
-    datadir = __pillar__['geodns.datadir']
-    if name.startswith(datadir) and name.endswith('.json'):
-        zone_file = name
-    else:
-        zone_file = '{0}/{1}{2}'.format(datadir, name, '.json')
-    return zone_file
-
-def get_zone(name):
-    zone = _get_zone(name)
-    return zone 
-
-def get_record(zone, name):
-    zone_file = get_full_path(zone)
-    zone_data = _get_zone(zone)
-    if name in zone_data[zone_file]['data']:
-        return {name: zone_data[zone_file]['data'][name]}
-    return {'Error': 'Could not locate name "{0}" in zone "{1}"'.format(name, zone)}
-
-def _save_zone(zone):
-    zone_file = zone.keys()[0]
-    f = open(zone_file, 'w')
-    json_data = json.dumps(zone[zone_file], indent=4, sort_keys=True)
-    if json_data:
-        f.write(json_data)
-        f.close()
-        return get_zone(zone_file)
-    return {'Error': 'Could not save zone {0}'.format(zone_file)}
-
-# value should be like [ ["192.168.0.1", 100], ["192.168.10.1", 50] ] for simple a record
-# only a records allowed for now
-def add_record(zone, name, value, type="a"):
-    zone_name = get_full_path(zone)
-    zone = get_zone(zone_name)
-    if name in zone[zone_name]['data']:
-        return {'Error': 'Record {0} already exists'.format(name)}
-    zone[zone_name]['data'][name] = {"a": value}
-    return _save_zone(zone)
-
-# TODO: this just replaces existing zone with data currently without question
-def add_zone(name, data={}):
-    datadir = __pillar__['geodns.datadir']
-    nameservers = __pillar__['geodns.nameservers']
-    default_data = {
-        "": {
-            "ns": nameservers
-        },
-        "data": {}
+def record_present(zone, name, value, type=None):
+    ret = {
+        'name': name,
+        'changes': {},
+        'result': True,
+        'comment': 'Record "{0}" already exists.'.format(name)
     }
-    zone_file = get_full_path(name)
-    if not data:
-        data = default_data
-    zone_data = {zone_file: data}
-    return _save_zone(zone_data) 
+    record = __salt__['geodns.get_record'](zone=zone,
+                                            name=name)
+    if 'Error' not in record:
+        if type is None:
+            type = __salt__['geodns.get_type'](record[name])
+        for file_name, content in record.iteritems():
+            current_value = content[type]
+            if not _values_equal(current_value, value):
+                __salt__['geodns.update_record'](zone=zone,
+                                                name=name,
+                                                value=value,
+                                                type=type)
+            ret['comment'] = 'Record "{0}" has been updated.'.format(name)
+            ret['changes']['Ips'] = 'Updated.'
+    else:
+        if type is None:
+            type = 'a'
+        record = __salt__['geodns.add_record'](zone=zone,
+                                                name=name,
+                                                value=value,
+                                                type=type)
 
-# I believe with geodns, there is only one key in a record for the record type
-def get_type(record):
-    return record.keys()[0]
-        
-def update_record(zone, name, value, type=None):
-    zone_name = get_full_path(zone)
-    zone_data = get_zone(zone_name)
-    if name in zone_data[zone_name]['data']:
-        if not type:
-            type = get_type(record)
-        zone_data[zone_name]['data'][name] = {type: value}
-    return _save_zone(zone_data)
+        ret['comment'] = 'Record "{0}" has been added.'.format(name)
+        ret['changes']['Record'] = 'Created.'
+    return ret
 
-def delete_record(zone, name):
-    zone_name = get_full_path(zone)
-    zone_data = get_zone(zone_name)
-    if name in zone_data[zone_name]['data']:
-        zone_data[zone_name]['data'].pop(name)
-    return _save_zone(zone_data)     
+def zone_present(name, zone_data={}):
+    modified = False
+    ret = {
+        'name': name,
+        'changes': {},
+        'result': True,
+        'comment': 'Zone "{0}" already exists.'.format(name)
+    }
+    zone = __salt__['geodns.get_zone'](name)
+    key = __salt__['geodns.get_full_path'](name)
+    # Zone does not exist yet
+    if 'Error' in zone:
+        zone = __salt__['geodns.add_zone'](name, zone_data)
+        ret['comment'] = 'Zone "{0}" has been created.'.format(name)
+        ret['changes']['Zone'] = 'Created.'
+    else:
+        if zone_data and zone_data != zone[key]:
+            zone = __salt__['geodns.add_zone'](name, zone_data)
+            ret['comment'] = 'Zone "{0}" has been updated.'.format(name)
+            ret['changes']['Zone'] = 'Updated.'
+    return ret
 
